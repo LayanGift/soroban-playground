@@ -35,7 +35,8 @@ pub enum DataKey {
     Provider(Address),
     Dataset(u64),
     ProviderDatasets(Address),
-    License(u64, Address), // (dataset_id, buyer)
+    License(u64, Address), // query quota and purchase accounting
+    Lease(u64, Address), // (dataset_id, buyer) -> expiration timestamp
     DatasetBuyers(u64),
     DatasetStats(u64),
     BuyerStats(Address),
@@ -147,6 +148,7 @@ const ACTIVE_CAP: u32 = 100;
 const TOPIC_LIST: Symbol = symbol_short!("list");
 const TOPIC_DELIST: Symbol = symbol_short!("delist");
 const TOPIC_BUY: Symbol = symbol_short!("buy");
+const TOPIC_ACCESS_GRANT: Symbol = symbol_short!("grant");
 const TOPIC_QUERY: Symbol = symbol_short!("query");
 const TOPIC_PAUSE: Symbol = symbol_short!("pause");
 
@@ -417,31 +419,46 @@ impl DataMarketplaceContract {
 
         let now = env.ledger().timestamp();
         let key = DataKey::License(dataset_id, buyer.clone());
-        let was_active = env
+        let lease_key = DataKey::Lease(dataset_id, buyer.clone());
+        let existing = env.storage().persistent().get::<_, License>(&key);
+        let current_expiry = env
             .storage()
             .persistent()
-            .get::<_, License>(&key)
-            .map(|l| l.expires_at > now && l.queries_used < l.queries_total)
-            .unwrap_or(false);
+            .get::<_, u64>(&lease_key)
+            .or_else(|| existing.as_ref().map(|license| license.expires_at));
+        let was_active = current_expiry.map(|expiry| expiry > now).unwrap_or(false);
 
-        let license = match env.storage().persistent().get::<_, License>(&key) {
-            Some(existing) if existing.expires_at > now => License {
-                expires_at: existing.expires_at.saturating_add(dataset.license_seconds),
-                queries_total: existing.queries_total.saturating_add(max_queries),
-                total_paid: existing.total_paid.saturating_add(cost),
-                ..existing
-            },
+        let license = match existing {
+            Some(existing) if current_expiry.map(|expiry| expiry > now).unwrap_or(false) => {
+                // Scale the added lease duration to the additional quota relative
+                // to the buyer's existing quota. Smaller top-ups receive shorter extensions.
+                let denominator = u64::from(existing.queries_total.max(1));
+                let numerator = dataset
+                    .license_seconds
+                    .checked_mul(u64::from(max_queries))
+                    .ok_or(Error::InvalidParameter)?;
+                let extension = (numerator / denominator).max(1);
+                let base_expiry = current_expiry.unwrap_or(now);
+                let expires_at = base_expiry.checked_add(extension).ok_or(Error::InvalidParameter)?;
+                License {
+                    expires_at,
+                    queries_total: existing.queries_total.saturating_add(max_queries),
+                    total_paid: existing.total_paid.saturating_add(cost),
+                    ..existing
+                }
+            }
             _ => License {
                 dataset_id,
                 buyer: buyer.clone(),
                 purchased_at: now,
-                expires_at: now.saturating_add(dataset.license_seconds),
+                expires_at: now.checked_add(dataset.license_seconds).ok_or(Error::InvalidParameter)?,
                 queries_total: max_queries,
                 queries_used: 0,
                 total_paid: cost,
             },
         };
         env.storage().persistent().set(&key, &license);
+        env.storage().persistent().set(&lease_key, &license.expires_at);
 
         // Dataset stats
         let mut ds_stats = Self::load_dataset_stats(&env, dataset_id);
@@ -476,8 +493,66 @@ impl DataMarketplaceContract {
             .set(&DataKey::BuyerStats(buyer.clone()), &b_stats);
 
         env.events()
-            .publish((TOPIC_BUY, dataset.provider, dataset_id), (buyer, cost));
+            .publish((TOPIC_BUY, dataset.provider.clone(), dataset_id), (buyer.clone(), cost));
+        // Off-chain key-management services listen for this standardized grant
+        // event and release the dataset decryption key until the recorded expiry.
+        env.events().publish(
+            (TOPIC_ACCESS_GRANT, dataset_id, buyer.clone()),
+            (license.expires_at, dataset.manifest_hash, dataset.encryption_pubkey),
+        );
         Ok(license)
+    }
+
+    /// Returns the lease expiry for a buyer and dataset.
+    pub fn get_lease_expiry(env: Env, dataset_id: u64, buyer: Address) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::Lease(dataset_id, buyer))
+    }
+
+    /// True only while the buyer's explicit lease has not expired.
+    pub fn has_valid_lease(env: Env, dataset_id: u64, buyer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::Lease(dataset_id, buyer))
+            .map(|expires_at| expires_at > env.ledger().timestamp())
+            .unwrap_or(false)
+    }
+
+    /// Permissionless cleanup for expired leases on one dataset. Soroban has no
+    /// autonomous cron execution, so an off-chain keeper must call this periodically.
+    pub fn cleanup_expired_leases(env: Env, dataset_id: u64) -> Result<u32, Error> {
+        let buyers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DatasetBuyers(dataset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().timestamp();
+        let mut cleaned = 0u32;
+
+        for buyer in buyers.iter() {
+            let lease_key = DataKey::Lease(dataset_id, buyer.clone());
+            if env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&lease_key)
+                .map(|expires_at| expires_at <= now)
+                .unwrap_or(false)
+            {
+                env.storage().persistent().remove(&lease_key);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::License(dataset_id, buyer));
+                cleaned = cleaned.saturating_add(1);
+            }
+        }
+
+        if cleaned > 0 {
+            let mut stats = Self::load_dataset_stats(&env, dataset_id);
+            stats.active_buyers = stats.active_buyers.saturating_sub(cleaned);
+            env.storage()
+                .persistent()
+                .set(&DataKey::DatasetStats(dataset_id), &stats);
+        }
+        Ok(cleaned)
     }
 
     pub fn get_license(env: Env, dataset_id: u64, buyer: Address) -> Option<License> {
@@ -514,7 +589,12 @@ impl DataMarketplaceContract {
             .ok_or(Error::LicenseNotFound)?;
 
         let now = env.ledger().timestamp();
-        if license.expires_at <= now {
+        let lease_expiry: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Lease(dataset_id, buyer.clone()))
+            .unwrap_or(license.expires_at);
+        if lease_expiry <= now {
             return Err(Error::LicenseExpired);
         }
         if license.queries_used >= license.queries_total {
