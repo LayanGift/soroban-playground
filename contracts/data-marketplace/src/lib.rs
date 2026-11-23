@@ -505,14 +505,20 @@ impl DataMarketplaceContract {
 
     /// Returns the lease expiry for a buyer and dataset.
     pub fn get_lease_expiry(env: Env, dataset_id: u64, buyer: Address) -> Option<u64> {
-        env.storage().persistent().get(&DataKey::Lease(dataset_id, buyer))
+        env.storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::Lease(dataset_id, buyer.clone()))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get::<_, License>(&DataKey::License(dataset_id, buyer))
+                    .map(|license| license.expires_at)
+            })
     }
 
     /// True only while the buyer's explicit lease has not expired.
     pub fn has_valid_lease(env: Env, dataset_id: u64, buyer: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get::<_, u64>(&DataKey::Lease(dataset_id, buyer))
+        Self::get_lease_expiry(env.clone(), dataset_id, buyer)
             .map(|expires_at| expires_at > env.ledger().timestamp())
             .unwrap_or(false)
     }
@@ -530,13 +536,17 @@ impl DataMarketplaceContract {
 
         for buyer in buyers.iter() {
             let lease_key = DataKey::Lease(dataset_id, buyer.clone());
-            if env
+            let expiry = env
                 .storage()
                 .persistent()
                 .get::<_, u64>(&lease_key)
-                .map(|expires_at| expires_at <= now)
-                .unwrap_or(false)
-            {
+                .or_else(|| {
+                    env.storage()
+                        .persistent()
+                        .get::<_, License>(&DataKey::License(dataset_id, buyer.clone()))
+                        .map(|license| license.expires_at)
+                });
+            if expiry.map(|expires_at| expires_at <= now).unwrap_or(false) {
                 env.storage().persistent().remove(&lease_key);
                 env.storage()
                     .persistent()
