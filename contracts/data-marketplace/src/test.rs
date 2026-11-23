@@ -263,3 +263,55 @@ fn verify_commitment_matches_sha256_of_preimage() {
     let other = Bytes::from_slice(&env, b"different");
     assert!(!client.verify_commitment(&commitment, &other));
 }
+
+#[test]
+fn explicit_lease_is_granted_and_expires() {
+    let (env, _admin, client) = setup();
+    let provider = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    register_provider(&env, &client, &provider);
+    let id = list_basic_dataset(&env, &client, &provider);
+    let license = client.purchase_access(&buyer, &id, &5_u32);
+
+    assert!(client.has_valid_lease(&id, &buyer));
+    assert_eq!(client.get_lease_expiry(&id, &buyer), Some(license.expires_at));
+
+    env.ledger().with_mut(|li| li.timestamp = license.expires_at);
+    assert!(!client.has_valid_lease(&id, &buyer));
+    assert_eq!(
+        client.try_submit_query(&buyer, &id, &b(&env, 0x44)).err().unwrap().unwrap(),
+        Error::LicenseExpired
+    );
+}
+
+#[test]
+fn lease_extension_is_prorated_to_quota_top_up() {
+    let (env, _admin, client) = setup();
+    let provider = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    register_provider(&env, &client, &provider);
+    let id = list_basic_dataset(&env, &client, &provider);
+    let first = client.purchase_access(&buyer, &id, &4_u32);
+    let second = client.purchase_access(&buyer, &id, &2_u32);
+
+    // Two additional queries against a four-query base quota add half a term.
+    let expected_extension = (7 * 24 * 60 * 60u64) / 2;
+    assert_eq!(second.expires_at, first.expires_at + expected_extension);
+    assert_eq!(second.queries_total, 6);
+}
+
+#[test]
+fn expired_lease_cleanup_removes_lease_and_license() {
+    let (env, _admin, client) = setup();
+    let provider = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    register_provider(&env, &client, &provider);
+    let id = list_basic_dataset(&env, &client, &provider);
+    let license = client.purchase_access(&buyer, &id, &2_u32);
+
+    env.ledger().with_mut(|li| li.timestamp = license.expires_at + 1);
+    assert_eq!(client.cleanup_expired_leases(&id), 1);
+    assert_eq!(client.get_lease_expiry(&id, &buyer), None);
+    assert_eq!(client.get_license(&id, &buyer), None);
+    assert_eq!(client.cleanup_expired_leases(&id), 0);
+}
